@@ -1,0 +1,472 @@
+' ===============================
+' Baixar APENAS PDFs com "po" ou "pedido" no NOME
+' (sinônimos de PO: purchase order, pedido de compra, ordem de compra)
+' Com renomeação: <CG|FPP>_<pedidoOuSEM_PEDIDO>_PO_<fornecedor>.pdf
+' ===============================
+Option Explicit
+
+' ============================
+' Configurações
+' ============================
+Private Const MARK_AS_READ As Boolean = False ' True para marcar e-mail como lido após salvar
+Private Const LOG_DEBUG As Boolean = True ' Exibe motivos no Immediate (Ctrl+G)
+Private Const SKIP_IF_EXISTS As Boolean = True ' Pula se destino final já existir
+
+' MODO solicit ado: baixar APENAS PDF cujo nome contenha "po" ou "pedido"
+Private Const ONLY_PO_PEDIDO As Boolean = True
+
+' Recomendado: excluir termos típicos de NF/boletos (danfe, nfe, nf-e, nota fiscal, boleto, linha digitável, fatura, duplicata, cobran…)
+' Se quiser pegar todo PDF que tenha "po"/"pedido" sem filtrar NF, coloque False.
+Private Const EXCLUIR_NF_BOLETO As Boolean = True
+
+' Ajuste seu caminho padrão
+Private Function PASTA_BASE_DESTINO() As String
+ PASTA_BASE_DESTINO = Environ$("USERPROFILE") & "\OneDrive - ALLOS\Área de Trabalho\Anexos\"
+End Function
+
+' ============================
+' Entrada principal
+' ============================
+Public Sub BaixarAnexosRenomeados()
+ On Error GoTo TratamentoErro
+
+ Dim olApp As Outlook.Application
+ Dim olNamespace As Outlook.NameSpace
+ Dim olInbox As Outlook.MAPIFolder
+ Dim olSubFolder As Outlook.MAPIFolder
+ Dim filteredItems As Outlook.Items
+ Dim item As Object
+ Dim mail As Outlook.MailItem
+ Dim att As Outlook.Attachment
+
+ Dim pastaDestinoBase As String
+ pastaDestinoBase = PASTA_BASE_DESTINO()
+ EnsureFolderExistsRecursive pastaDestinoBase
+
+ Set olApp = Outlook.Application
+ Set olNamespace = olApp.GetNamespace("MAPI")
+ Set olInbox = olNamespace.GetDefaultFolder(olFolderInbox)
+
+ ' Tenta localizar "NFE > 01.NOTAS" em raiz do mailbox OU dentro da Caixa de Entrada
+ Set olSubFolder = TryGetSubFolder(olNamespace, olInbox, "NFE", "01.NOTAS")
+ If olSubFolder Is Nothing Then
+ MsgBox "Subpasta 'NFE > 01.NOTAS' não encontrada.", vbExclamation, "Aviso"
+ GoTo Finalizar
+ End If
+
+ ' Filtra somente não lidos
+ Set filteredItems = olSubFolder.Items.Restrict("@SQL=""urn:schemas:httpmail:read"" = 0")
+
+ Dim anexosBaixadosNoGeral As Boolean
+ anexosBaixadosNoGeral = False
+
+ ' Mapa de arquivos salvos nesta execução (evitar duplicidade no mesmo run)
+ Dim savedMap As Object
+ Set savedMap = CreateObject("Scripting.Dictionary")
+
+ Dim corpoRaw As String, corpoLinhas As String, corpoCompacto As String
+ Dim assunto As String, senderName As String
+ Dim pedido As String, oc As String, pedidoValido As Boolean, ocValido As Boolean
+ Dim numeroNF As String, fornecedor As String
+ Dim pedidoUsar As String
+
+ For Each item In filteredItems
+ If TypeOf item Is Outlook.MailItem Then
+ Set mail = item
+ If mail.Attachments.Count > 0 Then
+ assunto = NzStr(mail.Subject)
+ senderName = NzStr(mail.SenderName)
+ corpoRaw = NzStr(mail.Body)
+ If Len(corpoRaw) = 0 Then GoTo ProximoItem
+
+ ' Normalizações
+ corpoLinhas = NormalizeForLines(corpoRaw)
+ corpoCompacto = RemoveAllWhitespace(corpoRaw)
+
+ ' Extrai PEDIDO/OC do corpo (apenas para ajudar na renomeação; inclusão é só pelo NOME do arquivo)
+ pedido = OnlyDigits(RegexGetFirst(corpoLinhas, LabelValuePatternTolerant("PEDIDO")))
+ oc = OnlyDigits(RegexGetFirst(corpoLinhas, LabelValuePatternTolerant("OC")))
+ If Len(pedido) = 0 Then pedido = OnlyDigits(RegexGetFirst(corpoCompacto, LabelValuePatternAfterCompact("PEDIDO")))
+ If Len(oc) = 0 Then oc = OnlyDigits(RegexGetFirst(corpoCompacto, LabelValuePatternAfterCompact("OC")))
+
+ pedidoValido = EhPedidoOcValido(pedido)
+ ocValido = EhPedidoOcValido(oc)
+ pedidoUsar = IIf(pedidoValido, pedido, IIf(ocValido, oc, ""))
+
+ ' Fornecedor (linha "Fornecedor:" ou remetente)
+ fornecedor = RegexGetLineValue(corpoLinhas, "Fornecedor")
+ If Len(Trim$(fornecedor)) = 0 Then fornecedor = senderName
+
+ ' Prefixo CG x FPP (mantido)
+ Dim prefixo As String
+ prefixo = DetectarPrefixo(corpoLinhas, assunto) ' "FPP" ou "CG"
+
+ ' Pasta base (pode adaptar para subpasta por pedido se quiser)
+ Dim pastaPedido As String
+ pastaPedido = pastaDestinoBase
+ EnsureFolderExistsRecursive pastaPedido
+
+ Dim i As Long
+ Dim salvouNesteEmail As Boolean
+ salvouNesteEmail = False
+
+ For i = 1 To mail.Attachments.Count
+ Set att = mail.Attachments(i)
+
+ Dim nomeArq As String, ext As String
+ nomeArq = NzStr(att.FileName)
+ ext = "." & LCase$(ObterExtensao(nomeArq))
+
+ If ONLY_PO_PEDIDO Then
+ ' ===== MODO: APENAS PO/PEDIDO NO NOME =====
+ If LCase$(ext) <> ".pdf" Then
+ If LOG_DEBUG Then Debug.Print "Ignorado (apenas PDF no modo ONLY_PO_PEDIDO): "; nomeArq
+ GoTo ProximoAnexo
+ End If
+
+ Dim nmLower As String
+ nmLower = LCase$(nomeArq)
+
+ ' Inclusão: nome deve conter "po" (token) OU a palavra "pedido" (qualquer posição, case-insensitive)
+ If Not MatchesPOPedido(nmLower) Then
+ If LOG_DEBUG Then Debug.Print "Ignorado (nome não contém PO/pedido): "; nomeArq
+ GoTo ProximoAnexo
+ End If
+
+ ' Exclusão opcional de NF/BOLETO
+ If EXCLUIR_NF_BOLETO Then
+ If IsProvavelNF(nmLower) Then
+ If LOG_DEBUG Then Debug.Print "Ignorado (parece NF/BOLETO): "; nomeArq
+ GoTo ProximoAnexo
+ End If
+ End If
+
+ ' ===== Renomeação =====
+ Dim fornecedorUsar As String
+ fornecedorUsar = SafeFileComponent(fornecedor)
+
+ ' Tenta extrair pedido 45xxxxxxxxxx do NOME; fallback = do corpo; senão "SEM_PEDIDO"
+ Dim pedidoDoNome As String
+ pedidoDoNome = ExtrairPedido45DoNomeFile(nomeArq)
+
+ Dim pedidoFinal As String
+ If Len(pedidoDoNome) > 0 Then
+ pedidoFinal = pedidoDoNome
+ ElseIf EhPedidoOcValido(pedidoUsar) Then
+ pedidoFinal = pedidoUsar
+ Else
+ pedidoFinal = "SEM_PEDIDO"
+ End If
+
+ Dim novoNome As String
+ novoNome = prefixo & "_" & pedidoFinal & "_PO_" & fornecedorUsar & ext
+
+ Dim destino As String
+ destino = pastaPedido & novoNome
+
+ If SKIP_IF_EXISTS Then
+ If FileExists(destino) Or savedMap.Exists(LCase$(destino)) Then
+ If LOG_DEBUG Then Debug.Print "Ignorado (já existe): "; destino
+ GoTo ProximoAnexo
+ End If
+ End If
+
+ att.SaveAsFile destino
+ savedMap(LCase$(destino)) = True
+ anexosBaixadosNoGeral = True
+ salvouNesteEmail = True
+ If LOG_DEBUG Then Debug.Print "Salvo (APENAS PO/PEDIDO): "; destino
+
+ Else
+ ' ===== Caso queira manter/comutar para comportamento antigo, pode inserir aqui. =====
+ If LOG_DEBUG Then Debug.Print "Modo antigo desabilitado. Ajuste ONLY_PO_PEDIDO se necessário."
+ End If
+ProximoAnexo:
+ Next i
+
+ ' Marcar como lido somente se ESTE e-mail teve anexo salvo
+ If MARK_AS_READ And salvouNesteEmail Then
+ mail.UnRead = False
+ mail.Save
+ End If
+ End If
+ End If
+ProximoItem:
+ Next item
+
+ If anexosBaixadosNoGeral Then
+ MsgBox "PDFs com 'po'/'pedido' baixados e renomeados com sucesso!", vbInformation, "Sucesso"
+ Else
+ MsgBox "Nenhum PDF elegível com 'po'/'pedido' encontrado em não lidos.", vbInformation, "Aviso"
+ End If
+
+Finalizar:
+ On Error Resume Next
+ Set att = Nothing
+ Set mail = Nothing
+ Set filteredItems = Nothing
+ Set olSubFolder = Nothing
+ Set olInbox = Nothing
+ Set olNamespace = Nothing
+ Set olApp = Nothing
+ Exit Sub
+
+TratamentoErro:
+ MsgBox "Erro " & Err.Number & ": " & Err.Description, vbCritical, "Falha"
+ Resume Finalizar
+End Sub
+
+' ============================
+' ======= Funções util =======
+' ============================
+
+Private Function TryGetSubFolder(ns As Outlook.NameSpace, inbox As Outlook.MAPIFolder, _
+ topLevel As String, subLevel As String) As Outlook.MAPIFolder
+ On Error Resume Next
+ Dim fld As Outlook.MAPIFolder
+
+ ' 1) No topo do mailbox
+ Set fld = ns.Folders(topLevel)
+ If Not fld Is Nothing Then
+ Set fld = fld.Folders(subLevel)
+ If Not fld Is Nothing Then
+ Set TryGetSubFolder = fld
+ Exit Function
+ End If
+ End If
+
+ ' 2) Dentro da Caixa de Entrada
+ Set fld = inbox.Folders(topLevel)
+ If Not fld Is Nothing Then
+ Set fld = fld.Folders(subLevel)
+ If Not fld Is Nothing Then
+ Set TryGetSubFolder = fld
+ Exit Function
+ End If
+ End If
+ On Error GoTo 0
+End Function
+
+Private Function NzStr(ByVal s As Variant) As String
+ If IsNull(s) Or IsEmpty(s) Then
+ NzStr = ""
+ Else
+ NzStr = CStr(s)
+ End If
+End Function
+
+' -------- Normalização --------
+
+Private Function NormalizeForLines(ByVal s As String) As String
+ Dim t As String
+ t = s
+ t = Replace(t, vbCrLf, vbLf)
+ t = Replace(t, vbCr, vbLf)
+ t = Replace(t, vbTab, " ")
+ t = Replace(t, Chr$(160), " ")
+ Do While InStr(t, " ") > 0
+ t = Replace(t, " ", " ")
+ Loop
+ NormalizeForLines = t
+End Function
+
+Private Function RemoveAllWhitespace(ByVal s As String) As String
+ Dim t As String
+ t = s
+ t = Replace(t, vbCrLf, "")
+ t = Replace(t, vbCr, "")
+ t = Replace(t, vbLf, "")
+ t = Replace(t, vbTab, "")
+ t = Replace(t, Chr$(160), "")
+ t = Replace(t, " ", "")
+ RemoveAllWhitespace = t
+End Function
+
+' -------- RegEx helpers --------
+
+Private Function RegexGetFirst(ByVal texto As String, ByVal pattern As String) As String
+ Dim re As Object, m As Object
+ Set re = CreateObject("VBScript.RegExp")
+ With re
+ .pattern = pattern
+ .IgnoreCase = True
+ .Global = False
+ .Multiline = True
+ End With
+ If re.Test(texto) Then
+ Set m = re.Execute(texto)(0)
+ If m.SubMatches.Count > 0 Then
+ RegexGetFirst = Trim$(m.SubMatches(0))
+ Else
+ RegexGetFirst = Trim$(m.Value)
+ End If
+ Else
+ RegexGetFirst = ""
+ End If
+End Function
+
+Private Function LabelValuePatternTolerant(ByVal label As String) As String
+ LabelValuePatternTolerant = label & "\s*[:\-–—]?\s*([^\r\n]+)"
+End Function
+
+Private Function LabelValuePatternAfterCompact(ByVal label As String) As String
+ LabelValuePatternAfterCompact = label & "[:\-–—]*\s*([0-9\.\-\/]+)"
+End Function
+
+Private Function RegexGetLineValue(ByVal texto As String, ByVal label As String) As String
+ RegexGetLineValue = RegexGetFirst(texto, LabelValuePatternTolerant(label))
+End Function
+
+' -------- Extras --------
+
+Private Function OnlyDigits(ByVal s As String) As String
+ Dim i As Long, ch As String, r As String
+ For i = 1 To Len(s)
+ ch = Mid$(s, i, 1)
+ If ch >= "0" And ch <= "9" Then r = r & ch
+ Next i
+ OnlyDigits = r
+End Function
+
+Private Function EhPedidoOcValido(ByVal codigo As String) As Boolean
+ ' Mantido para renomeação: 10 dígitos iniciando por 45 (se aparecer)
+ EhPedidoOcValido = (Len(codigo) = 10 And Left$(codigo, 2) = "45")
+End Function
+
+Private Function DetectarPrefixo(ByVal corpo As String, ByVal assunto As String) As String
+ ' Regra simples: achou "FPP" no assunto/corpo -> "FPP", senão "CG"
+ If InStr(1, assunto, "FPP", vbTextCompare) > 0 Or InStr(1, corpo, "FPP", vbTextCompare) > 0 Then
+ DetectarPrefixo = "FPP"
+ Else
+ DetectarPrefixo = "CG"
+ End If
+End Function
+
+Private Function ObterExtensao(ByVal fileName As String) As String
+ Dim p As Long: p = InStrRev(fileName, ".")
+ If p > 0 Then
+ ObterExtensao = Mid$(fileName, p + 1)
+ Else
+ ObterExtensao = ""
+ End If
+End Function
+
+' -------- Checagens PO/PEDIDO --------
+
+' Nome contém "po" (como token) OU a palavra "pedido"
+' - "po" como token/lado não alfanumérico ou seguido de dígitos (po123, _po_, -po-, po 123)
+' -> evita falso positivo em "report"
+' - "pedido" com bordas de palavra (evita "expedido")
+' - Também cobre sinônimos: purchase order, pedido de compra, ordem de compra
+Private Function MatchesPOPedido(ByVal nmLower As String) As Boolean
+ MatchesPOPedido = (IsArquivoPO(nmLower) Or HasPedidoWord(nmLower))
+End Function
+
+Private Function HasPedidoWord(ByVal nmLower As String) As Boolean
+ Dim re As Object
+ Set re = CreateObject("VBScript.RegExp")
+ With re
+ .IgnoreCase = True
+ .Global = False
+ .Multiline = False
+ .pattern = "(^|[^A-Za-z0-9])pedido([^A-Za-z0-9]|$)"
+ End With
+ HasPedidoWord = re.Test(nmLower)
+End Function
+
+' Cobre: "PO123", "reqPO123", "PO_123", "PO-123", "PO 123",
+' "purchase order", "pedido de compra", "ordem de compra"
+Private Function IsArquivoPO(ByVal nmLower As String) As Boolean
+ Dim re As Object
+ Set re = CreateObject("VBScript.RegExp")
+ With re
+ .IgnoreCase = True
+ .Global = False
+ .Multiline = False
+ ' "po" com bordas não alfanuméricas ou seguido por números; e sinônimos
+ .pattern = "po\d+|(^|[^A-Za-z0-9])po([^A-Za-z0-9]|$)|purchase[\s_\-]*order|pedido[\s_\-]*de[\s_\-]*compra|ordem[\s_\-]*de[\s_\-]*compra"
+ End With
+ IsArquivoPO = re.Test(nmLower)
+End Function
+
+' -------- Bloqueio facultativo de NF/BOLETO --------
+' Detecta nomes que parecem NOTA FISCAL ou BOLETO, para excluir se EXCLUIR_NF_BOLETO=True
+Private Function IsProvavelNF(ByVal nmLower As String) As Boolean
+ Dim re As Object
+ Set re = CreateObject("VBScript.RegExp")
+ With re
+ .IgnoreCase = True
+ .Global = False
+ .Multiline = False
+ ' Termos típicos de NF/boletos; "nf" isolado (evita confundir com "info")
+ .pattern = "(danfe|nfe|nf-?e|nota[\s_\-]*fiscal|(^|[^a-z])nf(\d|[^a-z]|$)|boleto|linha[\s_\-]*digit|fatura|duplicata|cobran)"
+ End With
+ IsProvavelNF = re.Test(nmLower)
+End Function
+
+' -------- Utilidades de arquivo/pasta --------
+Private Function SafeFileComponent(ByVal s As String) As String
+ Dim t As String, i As Long, ch As Integer
+ t = s
+ t = Replace(t, "\", " ")
+ t = Replace(t, "/", " ")
+ t = Replace(t, ":", " ")
+ t = Replace(t, "*", " ")
+ t = Replace(t, "?", " ")
+ t = Replace(t, """", " ")
+ t = Replace(t, "<", " ")
+ t = Replace(t, ">", " ")
+ t = Replace(t, "|", " ")
+ Dim sb As String
+ For i = 1 To Len(t)
+ ch = Asc(Mid$(t, i, 1))
+ If ch >= 32 Then sb = sb & Chr$(ch)
+ Next i
+ sb = Trim$(sb)
+ Do While InStr(sb, " ") > 0
+ sb = Replace(sb, " ", " ")
+ Loop
+ SafeFileComponent = sb
+End Function
+
+Private Function FileExists(ByVal fullPath As String) As Boolean
+ On Error Resume Next
+ FileExists = (Len(Dir$(fullPath, vbNormal)) > 0)
+End Function
+
+Private Sub EnsureFolderExistsRecursive(ByVal path As String)
+ Dim fso As Object, parts() As String, cur As String, i As Long
+ Set fso = CreateObject("Scripting.FileSystemObject")
+ If Len(path) = 0 Then Exit Sub
+ If Right$(path, 1) = "\" Then path = Left$(path, Len(path) - 1)
+ parts = Split(path, "\")
+ If UBound(parts) < 1 Then Exit Sub
+ cur = parts(0)
+ For i = 1 To UBound(parts)
+ cur = cur & "\" & parts(i)
+ If Not fso.FolderExists(cur) Then
+ On Error Resume Next
+ fso.CreateFolder cur
+ On Error GoTo 0
+ End If
+ Next i
+End Sub
+
+' -------- Heurística opcional para renomeação (não usada para incluir) --------
+' Busca 45xxxxxxxxxx no nome (ajuda a preencher <pedido> se presente)
+Private Function ExtrairPedido45DoNomeFile(ByVal nomeArquivo As String) As String
+ Dim re As Object, m As Object
+ Set re = CreateObject("VBScript.RegExp")
+ With re
+ .IgnoreCase = False
+ .Global = True
+ .Multiline = False
+ .pattern = "45\d{8}"
+ End With
+ If re.Test(nomeArquivo) Then
+ Set m = re.Execute(nomeArquivo)(0)
+ ExtrairPedido45DoNomeFile = m.Value
+ Else
+ ExtrairPedido45DoNomeFile = ""
+ End If
+End Function

@@ -1,0 +1,188 @@
+Option Explicit
+
+' ============================
+' CONFIGURAÇÕES
+' ============================
+Private Const MARK_AS_READ As Boolean = False
+Private Const SKIP_IF_EXISTS As Boolean = True
+Private Const LOG_DEBUG As Boolean = True
+
+Private Function PASTA_BASE_DESTINO() As String
+ PASTA_BASE_DESTINO = Environ$("USERPROFILE") & "\OneDrive - ALLOS\Área de Trabalho\Anexos\"
+End Function
+
+' ============================
+' SUB PRINCIPAL
+' ============================
+Public Sub BaixarAnexos_TUDO()
+ On Error GoTo TrataErro
+
+ Dim olApp As Outlook.Application
+ Dim ns As Outlook.NameSpace
+ Dim inbox As Outlook.MAPIFolder
+ Dim pastaNotas As Outlook.MAPIFolder
+ Dim itens As Outlook.Items
+ Dim item As Object
+ Dim mail As Outlook.MailItem
+ Dim att As Outlook.Attachment
+
+ Set olApp = Outlook.Application
+ Set ns = olApp.GetNamespace("MAPI")
+ Set inbox = ns.GetDefaultFolder(olFolderInbox)
+
+ Set pastaNotas = TryGetSubFolder(ns, inbox, "NFE", "01.NOTAS")
+ If pastaNotas Is Nothing Then
+ MsgBox "Pasta NFE > 01.NOTAS não encontrada.", vbCritical
+ Exit Sub
+ End If
+
+ EnsureFolderExistsRecursive PASTA_BASE_DESTINO()
+
+ Set itens = pastaNotas.Items.Restrict("@SQL=""urn:schemas:httpmail:read"" = 0")
+
+ Dim savedMap As Object
+ Set savedMap = CreateObject("Scripting.Dictionary")
+
+ Dim salvouNesteEmail As Boolean
+
+ For Each item In itens
+ If TypeOf item Is Outlook.MailItem Then
+ Set mail = item
+ salvouNesteEmail = False
+
+ If mail.Attachments.Count = 0 Then GoTo ProximoEmail
+
+ Dim i As Long
+ For i = 1 To mail.Attachments.Count
+ Set att = mail.Attachments(i)
+
+ Dim nomeOriginal As String
+ nomeOriginal = NzStr(att.FileName)
+
+ Dim extLower As String
+ extLower = LCase$(ObterExtensao(nomeOriginal))
+
+ ' Ignorar imagens
+ If EhImagem(extLower) Then
+ If LOG_DEBUG Then Debug.Print "Ignorado (imagem): " & nomeOriginal
+ GoTo ProxAnexo
+ End If
+
+ ' ===== NOME ORIGINAL (SEM RENOMEAR) =====
+ Dim nomeFinal As String
+ nomeFinal = SafeFileComponent(nomeOriginal)
+
+ Dim destino As String
+ destino = PASTA_BASE_DESTINO() & nomeFinal
+
+ If SKIP_IF_EXISTS Then
+ If FileExists(destino) Or savedMap.Exists(LCase$(destino)) Then
+ If LOG_DEBUG Then Debug.Print "Ignorado (já existe): " & destino
+ GoTo ProxAnexo
+ End If
+ End If
+
+ att.SaveAsFile destino
+ savedMap(LCase$(destino)) = True
+ salvouNesteEmail = True
+
+ If LOG_DEBUG Then Debug.Print "Salvo: " & destino
+
+ProxAnexo:
+ Next i
+
+ If MARK_AS_READ And salvouNesteEmail Then
+ mail.UnRead = False
+ mail.Save
+ End If
+ End If
+ProximoEmail:
+ Next item
+
+ MsgBox "✅ Anexos baixados com nome original.", vbInformation
+ Exit Sub
+
+TrataErro:
+ MsgBox "Erro: " & Err.Description, vbCritical
+End Sub
+
+' ============================
+' FUNÇÕES AUXILIARES
+' ============================
+
+Private Function TryGetSubFolder(ns As Outlook.NameSpace, inbox As Outlook.MAPIFolder, p1 As String, p2 As String) As Outlook.MAPIFolder
+ On Error Resume Next
+ Dim fld As Outlook.MAPIFolder
+
+ Set fld = ns.Folders(p1)
+ If Not fld Is Nothing Then
+ Set fld = fld.Folders(p2)
+ If Not fld Is Nothing Then Set TryGetSubFolder = fld: Exit Function
+ End If
+
+ Set fld = inbox.Folders(p1)
+ If Not fld Is Nothing Then
+ Set fld = fld.Folders(p2)
+ If Not fld Is Nothing Then Set TryGetSubFolder = fld
+ End If
+End Function
+
+Private Function EhImagem(extLower As String) As Boolean
+ EhImagem = (extLower = "jpg" Or extLower = "jpeg" Or extLower = "png" Or _
+ extLower = "gif" Or extLower = "bmp" Or extLower = "webp" Or _
+ extLower = "tiff" Or extLower = "tif" Or extLower = "heic" Or _
+ extLower = "heif" Or extLower = "svg" Or extLower = "ico" Or _
+ extLower = "jfif" Or extLower = "pjpeg" Or extLower = "pjp")
+End Function
+
+Private Function NzStr(ByVal v As Variant) As String
+ If IsNull(v) Or IsEmpty(v) Then NzStr = "" Else NzStr = CStr(v)
+End Function
+
+Private Function ObterExtensao(ByVal fileName As String) As String
+ Dim p As Long: p = InStrRev(fileName, ".")
+ If p > 0 Then ObterExtensao = Mid$(fileName, p + 1) Else ObterExtensao = ""
+End Function
+
+Private Function SafeFileComponent(ByVal s As String) As String
+ Dim t As String, i As Long, ch As Integer
+ t = s
+ t = Replace(t, "\", " ")
+ t = Replace(t, "/", " ")
+ t = Replace(t, ":", " ")
+ t = Replace(t, "*", " ")
+ t = Replace(t, "?", " ")
+ t = Replace(t, """", " ")
+ t = Replace(t, "<", " ")
+ t = Replace(t, ">", " ")
+ t = Replace(t, "|", " ")
+
+ Dim sb As String
+ For i = 1 To Len(t)
+ ch = Asc(Mid$(t, i, 1))
+ If ch >= 32 Then sb = sb & Chr$(ch)
+ Next i
+
+ Do While InStr(sb, " ") > 0
+ sb = Replace(sb, " ", " ")
+ Loop
+
+ SafeFileComponent = Trim$(sb)
+End Function
+
+Private Function FileExists(ByVal p As String) As Boolean
+ FileExists = (Dir$(p, vbNormal) <> "")
+End Function
+
+Private Sub EnsureFolderExistsRecursive(ByVal path As String)
+ Dim fso As Object, parts() As String, cur As String, i As Long
+ Set fso = CreateObject("Scripting.FileSystemObject")
+ If Right$(path, 1) = "\" Then path = Left$(path, Len(path) - 1)
+ parts = Split(path, "\")
+ cur = parts(0)
+ For i = 1 To UBound(parts)
+ cur = cur & "\" & parts(i)
+ If Not fso.FolderExists(cur) Then fso.CreateFolder cur
+ Next i
+End Sub
+
