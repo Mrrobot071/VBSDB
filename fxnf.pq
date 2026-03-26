@@ -1,4 +1,3 @@
-
 let
     Path = "C:\Users\lucas.nathan\OneDrive - ALLOS\Área de Trabalho\Anexostudo",
     KeepOnlyWithPedido = false,
@@ -16,7 +15,16 @@ let
 
     CleanWS = (t as nullable text) as text =>
         if t = null then ""
-        else Text.Trim(Text.Replace(Text.Replace(Text.Replace(Text.Clean(t), "#(lf)", " "), "#(cr)", " "), "#(tab)", " ")),
+        else
+            Text.Trim(
+                Text.Replace(
+                    Text.Replace(
+                        Text.Replace(Text.Clean(t), "#(lf)", " "),
+                        "#(cr)", " "
+                    ),
+                    "#(tab)", " "
+                )
+            ),
 
     NormalizeNoSpace = (t as nullable text) as text =>
         Text.Upper(Text.Remove(CleanWS(t), {" "})),    
@@ -31,31 +39,46 @@ let
             List.AnyTrue(List.Transform(needles, each Text.Contains(h, _, Comparer.OrdinalIgnoreCase))),
 
     // =====================================================
-    // ✅ PARSER MONETÁRIO ESTRITO (NUNCA "perde" os decimais)
-    // Aceita:
-    // - "8.687,74" (pt-BR) => 8687.74
-    // - "420,00"  (pt-BR) => 420.00
-    // - "420.00"  (en-US) => 420.00
-    // Rejeita/neutraliza códigos tipo "01.01.01" via filtro no tokenizador.
+    // ✅ PARSER MONETÁRIO "FIEL" (NÃO FORÇA DECIMAL)
+    // - Se token tiver decimais, respeita como veio (1 ou 2 casas)
+    // - Se token NÃO tiver decimais, vira inteiro
+    // - Suporta milhar com "." ou ","
     // =====================================================
-    ParseMoneyStrict = (tok as nullable text) as nullable number =>
+    ParseMoneyFaithful = (tok as nullable text) as nullable number =>
         let
             t0 = if tok = null then null else Text.Trim(tok),
             t1 = if t0 = null then null else Text.Select(t0, {"0".."9",".",","}),
             hasComma = if t1 = null then false else Text.Contains(t1, ","),
             hasDot   = if t1 = null then false else Text.Contains(t1, "."),
 
-            // define separador decimal
+            dotCount = if t1 = null then 0 else (List.Count(Text.Split(t1, ".")) - 1),
+            commaCount = if t1 = null then 0 else (List.Count(Text.Split(t1, ",")) - 1),
+
+            afterLastDot =
+                if t1 <> null and Text.Contains(t1, ".")
+                then Text.AfterDelimiter(t1, ".", {0, RelativePosition.FromEnd})
+                else "",
+
+            afterLastComma =
+                if t1 <> null and Text.Contains(t1, ",")
+                then Text.AfterDelimiter(t1, ",", {0, RelativePosition.FromEnd})
+                else "",
+
+            // Decide se há separador decimal REAL
+            // pt-BR: vírgula normalmente é decimal (1-2 casas)
+            // en: ponto pode ser decimal (1-2 casas)
             decSep =
-                if hasComma then ","
-                else if hasDot then "."
+                if hasComma and (Text.Length(afterLastComma) = 1 or Text.Length(afterLastComma) = 2) then ","
+                else if hasDot and (Text.Length(afterLastDot) = 1 or Text.Length(afterLastDot) = 2) then "."
                 else null,
 
-            // separador de milhar provável (oposto do decimal)
+            // define separador de milhar provável
             grpSep =
                 if decSep = "," then "."
                 else if decSep = "." then ","
-                else null,
+                else
+                    // sem decimal: vamos remover ambos para obter inteiro (mas preserva fidelidade no Tok, não no Num)
+                    null,
 
             parts =
                 if t1 = null or decSep = null
@@ -65,21 +88,27 @@ let
             intRaw = if List.Count(parts) >= 1 then parts{0} else "",
             decRaw = if List.Count(parts) >= 2 then parts{1} else "",
 
-            // remove separador de milhar do inteiro (ex.: 8.687 -> 8687)
+            // remove separador de milhar conhecido (quando há decimal)
             intNoGrp =
                 if grpSep <> null
                 then Text.Replace(intRaw, grpSep, "")
                 else intRaw,
 
-            intDigits = Text.Select(intNoGrp, {"0".."9"}),
+            // se NÃO há decimal, remove "." e "," do inteiro (milhar)
+            intNoGrp2 =
+                if decSep = null
+                then Text.Replace(Text.Replace(intNoGrp, ".", ""), ",", "")
+                else intNoGrp,
+
+            intDigits = Text.Select(intNoGrp2, {"0".."9"}),
             decDigits = Text.Select(decRaw, {"0".."9"}),
 
-            // força 2 casas (se vier vazio, vira "00"; se vier "7", vira "70")
-            dec2 = Text.Start(decDigits & "00", 2),
-
+            // compõe SEM forçar 2 casas
             composed =
                 if intDigits = null or intDigits = "" then null
-                else intDigits & "." & dec2,
+                else if decSep = null or decDigits = null or decDigits = ""
+                    then intDigits
+                    else intDigits & "." & decDigits,
 
             n = if composed = null then null else try Number.FromText(composed, "en-US") otherwise null
         in
@@ -382,13 +411,13 @@ let
             if HasXML or HasProduto then "PRODUTO" else "SERVIÇO",
 
     // =====================================================
-    // ✅ TOKENIZAÇÃO MONETÁRIA CORRIGIDA
-    // - só aceita tokens com:
-    //   a) vírgula (pt-BR), ou
-    //   b) UM único ponto como decimal (en-US)
-    // - rejeita "01.01.01" (múltiplos pontos)
+    // ✅ TOKENIZAÇÃO MONETÁRIA
+    // - Strict: exige aparência "monetária" (vírgula decimal ou ponto decimal)
+    // - Lenient: aceita também inteiros e milhar (10.000 / 420), MAS usada só perto dos anchors
+    // Retorno: lista de records [Tok=textoOriginal, Num=number]
     // =====================================================
-    MoneyTokensFromText = (seg as nullable text) as list =>
+
+    MoneyTokensFromText_Strict = (seg as nullable text) as list =>
         let
             s = if seg = null then "" else seg,
             mapped =
@@ -419,16 +448,82 @@ let
                     List.Transform(
                         toks1,
                         each
-                            let
-                                n = ParseMoneyStrict(_)
-                            in
-                                if n <> null and n > 0 then [Tok=_, Num=n] else null
+                            let n = ParseMoneyFaithful(_)
+                            in if n <> null and n > 0 then [Tok=_, Num=n] else null
                     )
                 )
         in
             recs,
 
-    ExtractValor = (t as nullable text) as nullable number =>
+    MoneyTokensFromText_Lenient = (seg as nullable text) as list =>
+        let
+            s = if seg = null then "" else seg,
+            mapped =
+                Text.Combine(
+                    List.Transform(
+                        Text.ToList(s),
+                        each if List.Contains({"0".."9",".",","}, _) then _ else "|"
+                    ),
+                    ""
+                ),
+            toks0 = List.Select(Text.Split(mapped, "|"), each Text.Length(_) > 0),
+
+            // rejeita padrões "01.01.01" (grupos pequenos com múltiplos separadores)
+            LooksLikeGroupedNumber = (tok as text, sep as text) as logical =>
+                let
+                    parts = List.Select(Text.Split(tok, sep), each _ <> ""),
+                    lens = List.Transform(parts, each Text.Length(Text.Select(_, {"0".."9"}))),
+                    okCount = List.Count(lens) >= 2,
+                    // primeiro grupo pode ter 1-3, os seguintes idealmente 3 (milhar)
+                    firstOk = if okCount then (lens{0} >= 1 and lens{0} <= 3) else false,
+                    rest = if okCount then List.Skip(lens, 1) else {},
+                    restOk = if List.Count(rest) = 0 then false else List.AllTrue(List.Transform(rest, each _ = 3)),
+                    allDigitsOk = List.AllTrue(List.Transform(parts, each Text.Length(Text.Remove(_, {"0".."9"})) = 0))
+                in
+                    okCount and firstOk and restOk and allDigitsOk,
+
+            IsOkLenient = (tok as text) as logical =>
+                let
+                    d = Text.Select(tok, {"0".."9"}),
+                    hasComma = Text.Contains(tok, ","),
+                    hasDot = Text.Contains(tok, "."),
+                    dotCount = List.Count(Text.Split(tok, ".")) - 1,
+                    commaCount = List.Count(Text.Split(tok, ",")) - 1,
+                    afterLastDot = if hasDot then Text.AfterDelimiter(tok, ".", {0, RelativePosition.FromEnd}) else "",
+                    afterLastComma = if hasComma then Text.AfterDelimiter(tok, ",", {0, RelativePosition.FromEnd}) else "",
+                    looksDecimalComma = hasComma and (Text.Length(afterLastComma) = 1 or Text.Length(afterLastComma) = 2),
+                    looksDecimalDot = hasDot and dotCount = 1 and (Text.Length(afterLastDot) = 1 or Text.Length(afterLastDot) = 2),
+
+                    // milhar "10.000" ou "1.234.567"
+                    looksThousandDot = hasDot and not hasComma and (LooksLikeGroupedNumber(tok, ".")),
+                    // milhar "1,234" (raro em BR, mas pode existir)
+                    looksThousandComma = hasComma and not hasDot and (LooksLikeGroupedNumber(tok, ",")),
+
+                    // inteiro puro "420"
+                    looksInteger = (not hasDot) and (not hasComma) and Text.Length(d) >= 3
+                in
+                    Text.Length(d) >= 3 and (looksDecimalComma or looksDecimalDot or looksThousandDot or looksThousandComma or looksInteger),
+
+            toks1 = List.Select(toks0, each IsOkLenient(_)),
+
+            recs =
+                List.RemoveNulls(
+                    List.Transform(
+                        toks1,
+                        each
+                            let n = ParseMoneyFaithful(_)
+                            in if n <> null and n > 0 then [Tok=_, Num=n] else null
+                    )
+                )
+        in
+            recs,
+
+    // =====================================================
+    // ✅ ExtractValorRec (FIEL com/sem decimais)
+    // - Busca próximo aos anchors com tokenização LENIENT (aceita 10.000 / 420)
+    // - Fallback mais seguro: usa STRICT no texto inteiro (evita pegar ano etc)
+    // =====================================================
+    ExtractValorRec = (t as nullable text) as nullable record =>
         let
             U0 = if t = null then null else NormalizeKeepSpace(t),
             U  = if U0 = null then "" else U0,
@@ -462,22 +557,23 @@ let
                     if p < 0 then null
                     else
                         let
-                            tail = Text.Middle(U, p + Text.Length(a), 200),
+                            tail = Text.Middle(U, p + Text.Length(a), 220),
                             pRS = Text.PositionOf(tail, "R$", Occurrence.First),
-                            afterRS = if pRS >= 0 then Text.Middle(tail, pRS + 2, 80) else tail,
+                            afterRS = if pRS >= 0 then Text.Middle(tail, pRS + 2, 120) else tail,
 
-                            toksAfterRS = MoneyTokensFromText(afterRS),
-                            n1 = if List.Count(toksAfterRS) > 0 then toksAfterRS{0}[Num] else null,
+                            // LENIENT aqui para pegar 10.000 / 420 sem decimal
+                            toksAfterRS = MoneyTokensFromText_Lenient(afterRS),
+                            r1 = if List.Count(toksAfterRS) > 0 then toksAfterRS{0} else null,
 
-                            toksTail = if n1 <> null then {} else MoneyTokensFromText(tail),
-                            n2 = if n1 <> null then n1 else if List.Count(toksTail) > 0 then toksTail{0}[Num] else null,
+                            toksTail = if r1 <> null then {} else MoneyTokensFromText_Lenient(tail),
+                            r2 = if r1 <> null then r1 else if List.Count(toksTail) > 0 then toksTail{0} else null,
 
                             ctxStart = if p - 40 < 0 then 0 else p - 40,
-                            ctxLen   = if (ctxStart + Text.Length(a) + 260) > Text.Length(U) then Text.Length(U) - ctxStart else Text.Length(a) + 260,
+                            ctxLen   = if (ctxStart + Text.Length(a) + 300) > Text.Length(U) then Text.Length(U) - ctxStart else Text.Length(a) + 300,
                             ctx      = Text.Range(U, ctxStart, ctxLen),
                             sc       = ScoreWindow(ctx)
                         in
-                            if n2 = null then null else [Val=n2, Score=sc, Pos=p],
+                            if r2 = null then null else [Tok=r2[Tok], Num=r2[Num], Score=sc, Pos=p],
 
             candByAnch = List.RemoveNulls(List.Transform(anchors, each CandFromAnchor(_))),
 
@@ -488,14 +584,15 @@ let
                         tbl    = Table.FromRecords(candByAnch),
                         sorted = Table.Sort(tbl, {{"Score", Order.Descending}, {"Pos", Order.Ascending}})
                     in
-                        sorted{0}[Val],
+                        [Tok=sorted{0}[Tok], Num=sorted{0}[Num]],
 
-            // fallback: pega o MAIOR valor monetário do texto (já filtrado corretamente)
-            allMoney = MoneyTokensFromText(U),
-            valsAll  = List.Transform(allMoney, each [Num]),
-            maxAll   = if List.Count(valsAll) > 0 then List.Max(valsAll) else null,
+            // fallback seguro: apenas STRICT no texto inteiro (evita pegar 2025, etc)
+            allMoneyStrict = MoneyTokensFromText_Strict(U),
+            numsAll  = List.Transform(allMoneyStrict, each _[Num]),
+            maxNum   = if List.Count(numsAll) > 0 then List.Max(numsAll) else null,
+            maxRec   = if maxNum = null then null else List.First(List.Select(allMoneyStrict, each _[Num] = maxNum), null),
 
-            result = if chosenAnch <> null then chosenAnch else maxAll
+            result = if chosenAnch <> null then chosenAnch else maxRec
         in
             result,
 
@@ -657,9 +754,7 @@ let
     RemPedidoAux = Table.RemoveColumns(AddPedido, {"PEDIDO_NOME", "PEDIDO_TEXTO"}),
 
     AddNF = Table.AddColumn(RemPedidoAux, "NUM_NF", each NFFromName([Name]), type text),
-
     AddCNPJ = Table.AddColumn(AddNF, "CNPJ", each ExtractCNPJ([TextAll]), type text),
-
     AddForn = Table.AddColumn(AddCNPJ, "FORNECEDOR", each FornecedorFromName([Name]), type text),
 
     AddEmiss_Txt = Table.AddColumn(AddForn, "EMISSAO_TXT", each ExtractEmissao([TextAll]), type date),
@@ -669,30 +764,39 @@ let
     AddTipo = Table.AddColumn(RemEmiss_Txt, "TIPO", each DetectTipo([Name], [TextPg1], [TextAll]), type text),
 
     // =====================================================
-    // ✅ VALOR CORRETO:
-    // - VALOR_NUM = número com 2 casas (8687.74)
-    // - VALOR     = texto SEMPRE "8.687,74"
+    // ✅ VALOR 100% FIEL AO PDF
+    // - VALOR     = Tok ORIGINAL (texto) como está no PDF (com ou sem decimais)
+    // - VALOR_NUM = Num para cálculos (sem inventar casas decimais)
     // =====================================================
-    AddValorNum = Table.AddColumn(
+    AddValorRec = Table.AddColumn(
         AddTipo,
-        "VALOR_NUM",
+        "VALOR_REC",
         each
             let
-                v1 = ExtractValor([TextPg1]),
-                v2 = if v1 = null then ExtractValor([TextAll]) else v1
+                r1 = ExtractValorRec([TextPg1]),
+                r2 = if r1 = null then ExtractValorRec([TextAll]) else r1
             in
-                if v2 = null then null else Number.Round(v2, 2),
+                r2,
+        type record
+    ),
+
+    AddValorNum = Table.AddColumn(
+        AddValorRec,
+        "VALOR_NUM",
+        each if [VALOR_REC] = null then null else [VALOR_REC][Num],
         type number
     ),
 
     AddValor = Table.AddColumn(
         AddValorNum,
         "VALOR",
-        each if [VALOR_NUM] = null then null else Number.ToText([VALOR_NUM], "#,##0.00", "pt-BR"),
+        each if [VALOR_REC] = null then null else [VALOR_REC][Tok],
         type text
     ),
 
-    AddNServ = Table.AddColumn(AddValor, "NUM_SERVICO", each ExtractNumServico([TextPg1]), type text),
+    RemValorRec = Table.RemoveColumns(AddValor, {"VALOR_REC"}),
+
+    AddNServ = Table.AddColumn(RemValorRec, "NUM_SERVICO", each ExtractNumServico([TextPg1]), type text),
 
     Selected =
         Table.SelectColumns(
@@ -713,6 +817,7 @@ let
     #"Tipo Alterado" = Table.TransformColumnTypes(
         #"Colunas Removidas",
         {{"EMISSAO", type date}, {"VALOR", type text}, {"VALOR_NUM", type number}}
-    )
+    ),
+    #"Colunas Removidas1" = Table.RemoveColumns(#"Tipo Alterado",{"VALOR_NUM"})
 in
-    #"Tipo Alterado"
+    #"Colunas Removidas1"
