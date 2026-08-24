@@ -1,0 +1,20 @@
+# Logs
+*.log
+npm-debug.log*
+.DS_Store
+
+# Dependencies
+node_modules/
+venv/
+__pycache__/
+*.pyc
+
+# Env / secrets
+.env
+.env.local
+*.key
+*.pem
+
+# Editor
+.vscode/
+.idea/
